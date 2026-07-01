@@ -6,7 +6,120 @@
 import React, { useEffect, useRef, useState, MouseEvent } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { GraphData, Node, NodeType } from '../types';
+// @ts-ignore
+import ELK from 'elkjs/lib/elk.bundled.js';
+import * as d3 from 'd3';
+import { GraphData, Node, Edge, NodeType } from '../types';
+
+const elk = new ELK();
+
+interface D3Node extends d3.SimulationNodeDatum {
+  id: string;
+  node: Node;
+}
+
+interface D3Link extends d3.SimulationLinkDatum<D3Node> {
+  source: string | D3Node;
+  target: string | D3Node;
+}
+
+function runD3Simulation(nodes: Node[], edges: Edge[]): Map<string, { x: number; z: number }> {
+  if (nodes.length === 0) {
+    return new Map();
+  }
+
+  // Map standard nodes to D3 simulation nodes
+  const d3Nodes: D3Node[] = nodes.map((node, index) => {
+    // Distribute initially in a circle to allow forces to expand them smoothly
+    const angle = (index / Math.max(1, nodes.length)) * Math.PI * 2;
+    const radius = 6 + Math.random() * 4;
+    return {
+      id: node.id,
+      node: node,
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+    };
+  });
+
+  // Deep copy edges for D3 simulation
+  const d3Edges: D3Link[] = edges.map((edge) => ({
+    source: edge.source,
+    target: edge.target,
+  }));
+
+  // Define custom grid alignment force (pulls nodes to grid cell multiples)
+  const gridForce = () => {
+    let simNodes: D3Node[] = [];
+    const cellSize = 6.0; // Size of each block cell in the grid (e.g. 6x6 units)
+    const strength = 0.35; // Strength of snap/grid attraction
+    
+    function force(alpha: number) {
+      for (let i = 0; i < simNodes.length; i++) {
+        const node = simNodes[i];
+        if (node.x === undefined || node.y === undefined) continue;
+        
+        // Find nearest grid block center coordinate
+        const targetX = Math.round(node.x / cellSize) * cellSize;
+        const targetY = Math.round(node.y / cellSize) * cellSize;
+        
+        node.vx = (node.vx || 0) + (targetX - node.x) * strength * alpha;
+        node.vy = (node.vy || 0) + (targetY - node.y) * strength * alpha;
+      }
+    }
+    
+    force.initialize = (_nodes: D3Node[]) => {
+      simNodes = _nodes;
+    };
+    return force;
+  };
+
+  // Build the D3 force simulation
+  const simulation = d3.forceSimulation<D3Node>(d3Nodes)
+    .force("charge", d3.forceManyBody().strength(-140))
+    .force("link", d3.forceLink<D3Node, D3Link>(d3Edges)
+      .id((d) => d.id)
+      .distance(10)
+      .strength(0.7)
+    )
+    .force("center", d3.forceCenter(0, 0))
+    .force("collision", d3.forceCollide().radius(4.5))
+    .force("grid", gridForce())
+    .stop();
+
+  // Tick the simulation offline 200 times to let it settle into grid arrangement
+  for (let i = 0; i < 200; i++) {
+    simulation.tick();
+  }
+
+  // Create lookup map of results
+  const resultMap = new Map<string, { x: number; z: number }>();
+  d3Nodes.forEach((dn) => {
+    resultMap.set(dn.id, {
+      x: dn.x !== undefined ? Math.max(-28, Math.min(28, dn.x)) : 0,
+      z: dn.y !== undefined ? Math.max(-28, Math.min(28, dn.y)) : 0,
+    });
+  });
+
+  return resultMap;
+}
+
+// Helper to calculate the shortest distance from a 2D point (px, py) to a 2D line segment (x1, y1) - (x2, y2)
+function getDistanceToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const l2 = dx * dx + dy * dy;
+  if (l2 === 0) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+  
+  // Projection factor
+  let t = ((px - x1) * dx + (py - y1) * dy) / l2;
+  t = Math.max(0, Math.min(1, t)); // Clamp to segment boundaries
+  
+  const projX = x1 + t * dx;
+  const projY = y1 + t * dy;
+  return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+}
+
+const CATEGORIES: Array<NodeType | 'All'> = ['All', 'Person', 'Organization', 'Infrastructure', 'Event', 'Concept'];
 
 interface GraphCanvasProps {
   graphData: GraphData;
@@ -49,6 +162,13 @@ export default function GraphCanvas({
   const [isIsometric, setIsIsometric] = useState(true);
   const [enablePhysics, setEnablePhysics] = useState(true);
 
+  // Search & Filter state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState<NodeType | 'All'>('All');
+
+  // Active hovered relation (edge)
+  const [hoveredEdge, setHoveredEdge] = useState<Edge | null>(null);
+
   // References for Three.js objects
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.OrthographicCamera | THREE.PerspectiveCamera | null>(null);
@@ -70,6 +190,78 @@ export default function GraphCanvas({
     Array<{ id: string; label: string; type: NodeType; x: number; y: number; height: number }>
   >([]);
 
+  // Store the processed ELK coordinates
+  const [layout, setLayout] = useState<any>(null);
+
+  // Store the processed D3 coordinates
+  const [d3Positions, setD3Positions] = useState<Map<string, { x: number; z: number }>>(new Map());
+
+  // Automatically trigger D3 force-directed simulation when data is loaded
+  useEffect(() => {
+    if (graphData.nodes.length > 0) {
+      const positions = runD3Simulation(graphData.nodes, graphData.edges);
+      setD3Positions(positions);
+    } else {
+      setD3Positions(new Map());
+    }
+  }, [graphData]);
+
+  // Calculate hierarchical layout using ELK engine
+  useEffect(() => {
+    let isMounted = true;
+    const calculateCityGrid = async () => {
+      // 1. SANITIZE DATA: Strip out "ghost edges" pointing to non-existent nodes
+      const validNodeIds = new Set(graphData.nodes.map(n => n.id));
+      const validEdges = graphData.edges.filter(
+        e => validNodeIds.has(e.source) && validNodeIds.has(e.target)
+      );
+
+      const elkGraph = {
+        id: "root",
+        layoutOptions: {
+          'elk.algorithm': 'layered',
+          'elk.direction': 'DOWN',
+          'elk.edgeRouting': 'ORTHOGONAL',
+          'elk.spacing.nodeNode': '100', // Increased spacing for a true city block feel
+          'elk.spacing.edgeNode': '50'
+        },
+        children: graphData.nodes.map(node => ({
+          id: node.id,
+          width: 10,  // Base size unit for ELK math
+          height: 10,
+          ...node
+        })),
+        edges: validEdges.map((edge, index) => ({
+          id: `edge_${index}`,
+          sources: [edge.source],
+          targets: [edge.target],
+          ...edge
+        }))
+      };
+
+      try {
+        const processedLayout = await elk.layout(elkGraph);
+        if (isMounted) {
+          setLayout(processedLayout);
+        }
+      } catch (error) {
+        console.error("ELK Layout Fatal Math Error:", error);
+      }
+    };
+
+    if (graphData.nodes.length > 0) {
+      calculateCityGrid();
+    } else {
+      if (isMounted) {
+        setLayout(null);
+      }
+    }
+
+    return () => {
+      isMounted = false;
+    };
+  }, [graphData]);
+
   // 1. Initialize Scene, Camera, Lights and Renderer
   useEffect(() => {
     if (!canvasRef.current || !containerRef.current) return;
@@ -79,8 +271,8 @@ export default function GraphCanvas({
 
     // Create Scene with space background
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x050508);
-    scene.fog = new THREE.FogExp2(0x050508, 0.015);
+    scene.background = new THREE.Color(0x000000);
+    scene.fog = new THREE.FogExp2(0x000000, 0.008);
     sceneRef.current = scene;
 
     // Create Renderer
@@ -99,12 +291,12 @@ export default function GraphCanvas({
     let camera: THREE.OrthographicCamera | THREE.PerspectiveCamera;
     if (isIsometric) {
       const aspect = width / height;
-      const d = 12;
-      camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 0.1, 1000);
-      camera.position.set(15, 15, 15);
+      const d = 25; // Matching d size to perfectly frame the larger city blocks layout
+      camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 0.1, 1000); // Standard positive near plane to avoid depth/shadow glitches
+      camera.position.set(40, 40, 40); // Elegantly pulled back isometric angle
     } else {
       camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
-      camera.position.set(15, 18, 20);
+      camera.position.set(40, 40, 40); // Consistent perspective angle
     }
     camera.lookAt(0, 0, 0);
     cameraRef.current = camera;
@@ -115,21 +307,21 @@ export default function GraphCanvas({
     controls.dampingFactor = 0.05;
     controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
     controls.minDistance = 3;
-    controls.maxDistance = 50;
+    controls.maxDistance = 200; // Increased to allow viewing the larger grid layout
     controlsRef.current = controls;
 
     // Add Lights
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.15);
     scene.add(ambientLight);
 
-    // Dynamic blue atmospheric point lights
-    const blueLight = new THREE.PointLight(0x3b82f6, 1.5, 30);
-    blueLight.position.set(-15, 5, -15);
-    scene.add(blueLight);
+    // Dynamic monochrome atmospheric point lights
+    const pointLight1 = new THREE.PointLight(0xffffff, 0.8, 35);
+    pointLight1.position.set(-15, 5, -15);
+    scene.add(pointLight1);
 
-    const tealLight = new THREE.PointLight(0x0d9488, 1.2, 30);
-    tealLight.position.set(15, 5, 15);
-    scene.add(tealLight);
+    const pointLight2 = new THREE.PointLight(0xffffff, 0.6, 35);
+    pointLight2.position.set(15, 5, 15);
+    scene.add(pointLight2);
 
     // Sun directional light casting shadows
     const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
@@ -150,7 +342,7 @@ export default function GraphCanvas({
     scene.add(sunLight);
 
     // Digital Grid ground helper
-    const grid = new THREE.GridHelper(80, 80, 0x1e293b, 0x0f172a);
+    const grid = new THREE.GridHelper(80, 80, 0x444444, 0x161616);
     grid.position.y = -0.01;
     scene.add(grid);
     groundGridRef.current = grid;
@@ -158,7 +350,7 @@ export default function GraphCanvas({
     // Ground reflector slab
     const groundGeo = new THREE.PlaneGeometry(200, 200);
     const groundMat = new THREE.MeshStandardMaterial({
-      color: 0x020205,
+      color: 0x050505,
       roughness: 0.8,
       metalness: 0.9,
     });
@@ -181,7 +373,7 @@ export default function GraphCanvas({
         cameraRef.current.updateProjectionMatrix();
       } else if (cameraRef.current instanceof THREE.OrthographicCamera) {
         const aspect = w / h;
-        const d = 12;
+        const d = 25; // Matching d size to perfectly frame the larger city blocks layout
         cameraRef.current.left = -d * aspect;
         cameraRef.current.right = d * aspect;
         cameraRef.current.top = d;
@@ -199,10 +391,10 @@ export default function GraphCanvas({
     };
   }, [isIsometric]);
 
-  // 2. Sync graphData to physics nodes and generate 3D meshes
+  // 2. Sync graphData and layout to physics nodes and generate 3D meshes
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene) return;
+    if (!scene || !layout) return;
 
     // Clean old meshes
     nodeMeshesRef.current.forEach((mesh) => scene.remove(mesh));
@@ -215,29 +407,61 @@ export default function GraphCanvas({
 
     const nextPhysicsNodes = new Map<string, PhysicsNode>();
 
-    // Determine physics nodes positions, maintaining positions if they already exist
-    graphData.nodes.forEach((node, i) => {
+    // Center coordinates around (0,0) and scale to 80x80 units grid
+    const centerX = layout.width ? layout.width / 2 : 0;
+    const centerY = layout.height ? layout.height / 2 : 0;
+    const maxDimension = Math.max(layout.width || 1, layout.height || 1, 400);
+    const scale = 40 / maxDimension; // Fits nicely inside grid boundaries
+
+    // Map each child position from ELK layout
+    const elkChildrenMap = new Map<string, { x: number; z: number }>();
+    if (layout.children) {
+      layout.children.forEach((child: any) => {
+        const childW = child.width || 100;
+        const childH = child.height || 100;
+        elkChildrenMap.set(child.id, {
+          x: (child.x + childW / 2 - centerX) * scale,
+          z: (child.y + childH / 2 - centerY) * scale,
+        });
+      });
+    }
+
+    // Transform static ELK point helpers
+    const transformPoint = (p: { x: number; y: number }) => {
+      return {
+        x: (p.x - centerX) * scale,
+        z: (p.y - centerY) * scale,
+      };
+    };
+
+    // Determine physics nodes positions, maintaining state
+    graphData.nodes.forEach((node) => {
       const existing = physicsNodesRef.current.get(node.id);
+      const d3Pos = d3Positions.get(node.id);
+      const elkPos = elkChildrenMap.get(node.id);
 
       // Node skyscraper height based on data complexity
       const historyCount = node.history ? node.history.length : 0;
       const metadataCount = node.metadata ? Object.keys(node.metadata).length : 0;
       const height = 0.8 + historyCount * 0.4 + metadataCount * 0.2;
 
+      // Prioritize D3 positions, fallback to ELK, then existing, then 0
+      const startX = d3Pos ? d3Pos.x : (elkPos ? elkPos.x : (existing ? existing.x : 0));
+      const startZ = d3Pos ? d3Pos.z : (elkPos ? elkPos.z : (existing ? existing.z : 0));
+
       if (existing) {
         nextPhysicsNodes.set(node.id, {
           ...existing,
+          x: draggingNodeIdRef.current === node.id ? existing.x : startX,
+          z: draggingNodeIdRef.current === node.id ? existing.z : startZ,
           node,
           height,
         });
       } else {
-        // Distribute newly added nodes on a circle
-        const angle = (i / Math.max(graphData.nodes.length, 1)) * Math.PI * 2;
-        const radius = 6 + Math.random() * 2;
         nextPhysicsNodes.set(node.id, {
           id: node.id,
-          x: Math.cos(angle) * radius,
-          z: Math.sin(angle) * radius,
+          x: startX,
+          z: startZ,
           vx: 0,
           vz: 0,
           node,
@@ -284,7 +508,7 @@ export default function GraphCanvas({
         const slabWidth = buildingWidth + 0.35 - h * 0.08;
         const slabGeo = new THREE.BoxGeometry(slabWidth, 0.08, slabWidth);
         const slabMat = new THREE.MeshStandardMaterial({
-          color: 0x0f172a,
+          color: 0x161616,
           roughness: 0.4,
           metalness: 0.9,
           emissive: config.emissive,
@@ -331,26 +555,153 @@ export default function GraphCanvas({
     const edgePositions: number[] = [];
     const edgeColors: number[] = [];
 
-    graphData.edges.forEach((edge) => {
-      const sourceNode = physicsNodesRef.current.get(edge.source);
-      const targetNode = physicsNodesRef.current.get(edge.target);
+    const hasFocus = !!selectedNodeId || !!hoveredNodeId || !!hoveredEdge || searchQuery.trim().length > 0 || selectedCategory !== 'All';
 
-      if (sourceNode && targetNode) {
-        // Connect bases of buildings (slightly raised to look floating)
-        const sourceColor = TYPE_CONFIGS[sourceNode.node.type]?.color || '#ffffff';
-        const targetColor = TYPE_CONFIGS[targetNode.node.type]?.color || '#ffffff';
+    // If physics is paused, render orthogonal street segments computed by ELK!
+    if (!enablePhysics && layout.edges) {
+      layout.edges.forEach((elkEdge: any) => {
+        const sourceNode = graphData.nodes.find((n) => n.id === elkEdge.source);
+        const targetNode = graphData.nodes.find((n) => n.id === elkEdge.target);
+        if (!sourceNode || !targetNode) return;
 
+        const sourceColor = TYPE_CONFIGS[sourceNode.type]?.color || '#ffffff';
+        const targetColor = TYPE_CONFIGS[targetNode.type]?.color || '#ffffff';
         const sCol = new THREE.Color(sourceColor);
         const tCol = new THREE.Color(targetColor);
 
-        // Add start and end points
-        edgePositions.push(sourceNode.x, 0.15, sourceNode.z);
-        edgePositions.push(targetNode.x, 0.15, targetNode.z);
+        // Highlight check
+        const isHovered = hoveredEdge && 
+          ((hoveredEdge.source === elkEdge.source && hoveredEdge.target === elkEdge.target) || 
+           (hoveredEdge.target === elkEdge.source && hoveredEdge.source === elkEdge.target));
+        const isConnectedToHovered = hoveredNodeId === elkEdge.source || hoveredNodeId === elkEdge.target;
+        const isConnectedToSelected = selectedNodeId === elkEdge.source || selectedNodeId === elkEdge.target;
 
-        edgeColors.push(sCol.r, sCol.g, sCol.b);
-        edgeColors.push(tCol.r, tCol.g, tCol.b);
-      }
-    });
+        const sourceMatchesSearch = searchQuery.trim() === '' || 
+          sourceNode.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+          sourceNode.id.toLowerCase().includes(searchQuery.toLowerCase());
+        const targetMatchesSearch = searchQuery.trim() === '' || 
+          targetNode.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+          targetNode.id.toLowerCase().includes(searchQuery.toLowerCase());
+        
+        const sourceMatchesCategory = selectedCategory === 'All' || sourceNode.type === selectedCategory;
+        const targetMatchesCategory = selectedCategory === 'All' || targetNode.type === selectedCategory;
+
+        const isSourceMatched = sourceMatchesSearch && sourceMatchesCategory;
+        const isTargetMatched = targetMatchesSearch && targetMatchesCategory;
+
+        const matchesActiveFilters = hasFocus && (isSourceMatched || isTargetMatched);
+        const isHighlighted = isHovered || isConnectedToHovered || isConnectedToSelected || matchesActiveFilters;
+
+        if (elkEdge.sections) {
+          elkEdge.sections.forEach((section: any) => {
+            const points: { x: number; z: number }[] = [];
+
+            if (section.startPoint) {
+              points.push(transformPoint(section.startPoint));
+            }
+            if (section.bendPoints) {
+              section.bendPoints.forEach((bp: any) => {
+                points.push(transformPoint(bp));
+              });
+            }
+            if (section.endPoint) {
+              points.push(transformPoint(section.endPoint));
+            }
+
+            for (let i = 0; i < points.length - 1; i++) {
+              const p1 = points[i];
+              const p2 = points[i + 1];
+
+              edgePositions.push(p1.x, 0.15, p1.z);
+              edgePositions.push(p2.x, 0.15, p2.z);
+
+              const ratio = i / Math.max(points.length - 1, 1);
+              const segmentCol = sCol.clone().lerp(tCol, ratio);
+              const nextSegmentCol = sCol.clone().lerp(tCol, (i + 1) / Math.max(points.length - 1, 1));
+
+              let r1 = segmentCol.r;
+              let g1 = segmentCol.g;
+              let b1 = segmentCol.b;
+              let r2 = nextSegmentCol.r;
+              let g2 = nextSegmentCol.g;
+              let b2 = nextSegmentCol.b;
+
+              if (!isHighlighted && hasFocus) {
+                const dimFactor = 0.08;
+                r1 *= dimFactor; g1 *= dimFactor; b1 *= dimFactor;
+                r2 *= dimFactor; g2 *= dimFactor; b2 *= dimFactor;
+              } else if (!hasFocus) {
+                const normFactor = 0.7;
+                r1 *= normFactor; g1 *= normFactor; b1 *= normFactor;
+                r2 *= normFactor; g2 *= normFactor; b2 *= normFactor;
+              }
+
+              edgeColors.push(r1, g1, b1);
+              edgeColors.push(r2, g2, b2);
+            }
+          });
+        }
+      });
+    } else {
+      // Direct straight line representation between active physics coordinates
+      graphData.edges.forEach((edge) => {
+        const sourceNode = physicsNodesRef.current.get(edge.source);
+        const targetNode = physicsNodesRef.current.get(edge.target);
+
+        if (sourceNode && targetNode) {
+          const sourceColor = TYPE_CONFIGS[sourceNode.node.type]?.color || '#ffffff';
+          const targetColor = TYPE_CONFIGS[targetNode.node.type]?.color || '#ffffff';
+
+          const sCol = new THREE.Color(sourceColor);
+          const tCol = new THREE.Color(targetColor);
+
+          // Highlight check
+          const isHovered = hoveredEdge === edge || 
+            (hoveredEdge && hoveredEdge.source === edge.source && hoveredEdge.target === edge.target);
+          const isConnectedToHovered = hoveredNodeId === edge.source || hoveredNodeId === edge.target;
+          const isConnectedToSelected = selectedNodeId === edge.source || selectedNodeId === edge.target;
+
+          const sourceMatchesSearch = searchQuery.trim() === '' || 
+            sourceNode.node.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+            sourceNode.node.id.toLowerCase().includes(searchQuery.toLowerCase());
+          const targetMatchesSearch = searchQuery.trim() === '' || 
+            targetNode.node.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+            targetNode.node.id.toLowerCase().includes(searchQuery.toLowerCase());
+          
+          const sourceMatchesCategory = selectedCategory === 'All' || sourceNode.node.type === selectedCategory;
+          const targetMatchesCategory = selectedCategory === 'All' || targetNode.node.type === selectedCategory;
+
+          const isSourceMatched = sourceMatchesSearch && sourceMatchesCategory;
+          const isTargetMatched = targetMatchesSearch && targetMatchesCategory;
+
+          const matchesActiveFilters = hasFocus && (isSourceMatched || isTargetMatched);
+          const isHighlighted = isHovered || isConnectedToHovered || isConnectedToSelected || matchesActiveFilters;
+
+          edgePositions.push(sourceNode.x, 0.15, sourceNode.z);
+          edgePositions.push(targetNode.x, 0.15, targetNode.z);
+
+          let r1 = sCol.r;
+          let g1 = sCol.g;
+          let b1 = sCol.b;
+          let r2 = tCol.r;
+          let g2 = tCol.g;
+          let b2 = tCol.b;
+
+          if (!isHighlighted && hasFocus) {
+            const dimFactor = 0.08;
+            r1 *= dimFactor; g1 *= dimFactor; b1 *= dimFactor;
+            r2 *= dimFactor; g2 *= dimFactor; b2 *= dimFactor;
+          } else if (!hasFocus) {
+            const normFactor = 0.7;
+            r1 *= normFactor; g1 *= normFactor; b1 *= normFactor;
+            r2 *= normFactor; g2 *= normFactor; b2 *= normFactor;
+          }
+
+          edgeColors.push(r1, g1, b1);
+          edgeColors.push(r2, g2, b2);
+        }
+      });
+    }
 
     const edgeGeo = new THREE.BufferGeometry();
     edgeGeo.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
@@ -360,39 +711,107 @@ export default function GraphCanvas({
       vertexColors: true,
       linewidth: 2,
       transparent: true,
-      opacity: 0.65,
+      opacity: 0.85,
     });
 
     const edgeLines = new THREE.LineSegments(edgeGeo, edgeMat);
     scene.add(edgeLines);
     edgeLinesRef.current = edgeLines;
-  }, [graphData, selectedNodeId, hoveredNodeId]);
+  }, [graphData, layout, d3Positions, enablePhysics, selectedNodeId, hoveredNodeId, isIsometric, hoveredEdge, searchQuery, selectedCategory]);
 
   // 3. Update building glowing intensity on hover/selection
   useEffect(() => {
+    const hasFocus = !!selectedNodeId || !!hoveredNodeId || !!hoveredEdge || searchQuery.trim().length > 0 || selectedCategory !== 'All';
+
     graphData.nodes.forEach((node) => {
       const group = nodeMeshesRef.current.get(node.id);
-      if (group) {
-        const building = group.children.find((c: any) => c.userData?.isBuilding) as THREE.Mesh;
-        if (building && building.material instanceof THREE.MeshStandardMaterial) {
-          const config = TYPE_CONFIGS[node.type];
-          if (config) {
-            let intensity = 0.25;
-            if (selectedNodeId === node.id) {
-              intensity = 1.8;
-              building.material.color.setHex(0xffffff); // Glow hyper-white-tint
-            } else if (hoveredNodeId === node.id) {
-              intensity = 1.1;
-              building.material.color.setHex(config.hex);
+      if (!group) return;
+
+      const isSelected = selectedNodeId === node.id;
+      const isHovered = hoveredNodeId === node.id;
+
+      // Check search & category matches
+      const matchesSearch = searchQuery.trim() === '' || 
+        node.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+        node.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        node.type.toLowerCase().includes(searchQuery.toLowerCase());
+      
+      const matchesCategory = selectedCategory === 'All' || node.type === selectedCategory;
+      const isFilterMatched = matchesSearch && matchesCategory;
+
+      // Check connections
+      const isConnectedToHovered = hoveredNodeId ? graphData.edges.some(
+        e => (e.source === hoveredNodeId && e.target === node.id) || (e.target === hoveredNodeId && e.source === node.id)
+      ) : false;
+
+      const isConnectedToSelected = selectedNodeId ? graphData.edges.some(
+        e => (e.source === selectedNodeId && e.target === node.id) || (e.target === selectedNodeId && e.source === node.id)
+      ) : false;
+
+      const isConnectedToHoveredEdge = hoveredEdge ? (
+        hoveredEdge.source === node.id || hoveredEdge.target === node.id
+      ) : false;
+
+      // Determine final visual level: 'highlight' | 'normal' | 'dimmed'
+      let visualState: 'highlight' | 'normal' | 'dimmed' = 'normal';
+      
+      if (isSelected || isHovered) {
+        visualState = 'highlight';
+      } else if (isConnectedToHovered || isConnectedToSelected || isConnectedToHoveredEdge) {
+        visualState = 'highlight';
+      } else if (hasFocus && isFilterMatched) {
+        visualState = 'highlight';
+      } else if (hasFocus) {
+        visualState = 'dimmed';
+      }
+
+      const config = TYPE_CONFIGS[node.type];
+      if (!config) return;
+
+      group.traverse((child: any) => {
+        if (child instanceof THREE.Mesh) {
+          if (child.material instanceof THREE.MeshStandardMaterial) {
+            child.material.transparent = true;
+            if (visualState === 'highlight') {
+              child.material.opacity = 1.0;
+              child.material.emissiveIntensity = isSelected ? 1.8 : isHovered ? 1.4 : 1.0;
+              child.material.color.setHex(isSelected ? 0xffffff : config.hex);
+            } else if (visualState === 'dimmed') {
+              child.material.opacity = 0.15;
+              child.material.emissiveIntensity = 0.05;
+              child.material.color.setHex(config.hex);
             } else {
-              building.material.color.setHex(config.hex);
+              child.material.opacity = 1.0;
+              child.material.emissiveIntensity = 0.25;
+              child.material.color.setHex(config.hex);
             }
-            building.material.emissiveIntensity = intensity;
+          } else if (child.material instanceof THREE.MeshBasicMaterial) {
+            child.material.transparent = true;
+            if (visualState === 'highlight') {
+              child.material.opacity = 1.0;
+            } else if (visualState === 'dimmed') {
+              child.material.opacity = 0.1;
+            } else {
+              child.material.opacity = 1.0;
+            }
+          }
+        } else if (child instanceof THREE.LineSegments) {
+          if (child.material instanceof THREE.LineBasicMaterial) {
+            child.material.transparent = true;
+            if (visualState === 'highlight') {
+              child.material.opacity = 1.0;
+              child.material.color.setHex(config.hex);
+            } else if (visualState === 'dimmed') {
+              child.material.opacity = 0.1;
+            } else {
+              child.material.opacity = 0.6;
+              child.material.color.setHex(config.hex);
+            }
           }
         }
-      }
+      });
     });
-  }, [selectedNodeId, hoveredNodeId, graphData]);
+  }, [selectedNodeId, hoveredNodeId, graphData, hoveredEdge, searchQuery, selectedCategory]);
 
   // 4. Force-directed physics layout and main animation loop
   useEffect(() => {
@@ -522,9 +941,13 @@ export default function GraphCanvas({
         }
       });
 
-      // Update edges lines endpoints
+      // Update edges lines endpoints and colors
       if (edgeLinesRef.current && physicsNodesRef.current.size > 0) {
         const positionsArr: number[] = [];
+        const colorArr: number[] = [];
+
+        const hasFocus = !!selectedNodeId || !!hoveredNodeId || !!hoveredEdge || searchQuery.trim().length > 0 || selectedCategory !== 'All';
+
         graphData.edges.forEach((edge) => {
           const sNode = physicsNodesRef.current.get(edge.source);
           const tNode = physicsNodesRef.current.get(edge.target);
@@ -541,6 +964,51 @@ export default function GraphCanvas({
 
             positionsArr.push(sx, 0.15, sz);
             positionsArr.push(tx, 0.15, tz);
+
+            const sCol = new THREE.Color(TYPE_CONFIGS[sNode.node.type]?.color || '#ffffff');
+            const tCol = new THREE.Color(TYPE_CONFIGS[tNode.node.type]?.color || '#ffffff');
+
+            // Highlight check
+            const isHovered = hoveredEdge === edge || 
+              (hoveredEdge && hoveredEdge.source === edge.source && hoveredEdge.target === edge.target);
+            const isConnectedToHovered = hoveredNodeId === edge.source || hoveredNodeId === edge.target;
+            const isConnectedToSelected = selectedNodeId === edge.source || selectedNodeId === edge.target;
+
+            const sourceMatchesSearch = searchQuery.trim() === '' || 
+              sNode.node.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+              sNode.node.id.toLowerCase().includes(searchQuery.toLowerCase());
+            const targetMatchesSearch = searchQuery.trim() === '' || 
+              tNode.node.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+              tNode.node.id.toLowerCase().includes(searchQuery.toLowerCase());
+            
+            const sourceMatchesCategory = selectedCategory === 'All' || sNode.node.type === selectedCategory;
+            const targetMatchesCategory = selectedCategory === 'All' || tNode.node.type === selectedCategory;
+
+            const isSourceMatched = sourceMatchesSearch && sourceMatchesCategory;
+            const isTargetMatched = targetMatchesSearch && targetMatchesCategory;
+
+            const matchesActiveFilters = hasFocus && (isSourceMatched || isTargetMatched);
+            const isHighlighted = isHovered || isConnectedToHovered || isConnectedToSelected || matchesActiveFilters;
+
+            let r1 = sCol.r;
+            let g1 = sCol.g;
+            let b1 = sCol.b;
+            let r2 = tCol.r;
+            let g2 = tCol.g;
+            let b2 = tCol.b;
+
+            if (!isHighlighted && hasFocus) {
+              const dimFactor = 0.08;
+              r1 *= dimFactor; g1 *= dimFactor; b1 *= dimFactor;
+              r2 *= dimFactor; g2 *= dimFactor; b2 *= dimFactor;
+            } else if (!hasFocus) {
+              const normFactor = 0.7;
+              r1 *= normFactor; g1 *= normFactor; b1 *= normFactor;
+              r2 *= normFactor; g2 *= normFactor; b2 *= normFactor;
+            }
+
+            colorArr.push(r1, g1, b1);
+            colorArr.push(r2, g2, b2);
           }
         });
 
@@ -553,21 +1021,16 @@ export default function GraphCanvas({
           edgeLinesRef.current.geometry.dispose();
           const newGeo = new THREE.BufferGeometry();
           newGeo.setAttribute('position', new THREE.Float32BufferAttribute(positionsArr, 3));
-
-          // Retain colors
-          const colorArr: number[] = [];
-          graphData.edges.forEach((edge) => {
-            const sNode = physicsNodesRef.current.get(edge.source);
-            const tNode = physicsNodesRef.current.get(edge.target);
-            if (sNode && tNode) {
-              const sCol = new THREE.Color(TYPE_CONFIGS[sNode.node.type]?.color || '#ffffff');
-              const tCol = new THREE.Color(TYPE_CONFIGS[tNode.node.type]?.color || '#ffffff');
-              colorArr.push(sCol.r, sCol.g, sCol.b);
-              colorArr.push(tCol.r, tCol.g, tCol.b);
-            }
-          });
           newGeo.setAttribute('color', new THREE.Float32BufferAttribute(colorArr, 3));
           edgeLinesRef.current.geometry = newGeo;
+          const colAttr = edgeLinesRef.current.geometry.getAttribute('color') as THREE.BufferAttribute;
+          if (colAttr) colAttr.needsUpdate = true;
+        }
+
+        const colAttr = edgeLinesRef.current.geometry.getAttribute('color') as THREE.BufferAttribute;
+        if (colAttr && colAttr.count === colorArr.length / 3) {
+          colAttr.copyArray(colorArr);
+          colAttr.needsUpdate = true;
         }
       }
 
@@ -613,7 +1076,7 @@ export default function GraphCanvas({
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [graphData, enablePhysics, selectedNodeId]);
+  }, [graphData, enablePhysics, selectedNodeId, hoveredNodeId, hoveredEdge, searchQuery, selectedCategory]);
 
   // 5. Mouse Interaction, raycasting, clicking and dragging
   const handleMouseMove = (e: MouseEvent<HTMLCanvasElement>) => {
@@ -660,6 +1123,58 @@ export default function GraphCanvas({
 
     if (foundNodeId !== hoveredNodeId) {
       onHoverNode(foundNodeId);
+    }
+
+    // If a node is hovered, reset edge hover and return
+    if (foundNodeId) {
+      if (hoveredEdge !== null) {
+        setHoveredEdge(null);
+      }
+      return;
+    }
+
+    // Otherwise, check if mouse is close to a 2D projected edge line segment
+    let foundEdge: Edge | null = null;
+    if (graphData.edges.length > 0) {
+      const w = containerRef.current.clientWidth;
+      const h = containerRef.current.clientHeight;
+
+      const projectedCoords = new Map<string, { x: number; y: number }>();
+      graphData.nodes.forEach((node) => {
+        const group = nodeMeshesRef.current.get(node.id);
+        const physNode = physicsNodesRef.current.get(node.id);
+        if (group && physNode) {
+          const tempV = new THREE.Vector3();
+          tempV.set(group.position.x, physNode.height / 2, group.position.z);
+          tempV.project(cameraRef.current!);
+          projectedCoords.set(node.id, {
+            x: (tempV.x * 0.5 + 0.5) * w,
+            y: (tempV.y * -0.5 + 0.5) * h,
+          });
+        }
+      });
+
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      let minDistance = Infinity;
+      const hoverThresholdPx = 14; // comfort zone
+
+      graphData.edges.forEach((edge) => {
+        const s = projectedCoords.get(edge.source);
+        const t = projectedCoords.get(edge.target);
+        if (s && t) {
+          const dist = getDistanceToSegment(mouseX, mouseY, s.x, s.y, t.x, t.y);
+          if (dist < minDistance && dist < hoverThresholdPx) {
+            minDistance = dist;
+            foundEdge = edge;
+          }
+        }
+      });
+    }
+
+    if (foundEdge !== hoveredEdge) {
+      setHoveredEdge(foundEdge);
     }
   };
 
@@ -711,6 +1226,14 @@ export default function GraphCanvas({
 
   return (
     <div id="3d-canvas-wrapper" className="relative w-full h-full select-none overflow-hidden" ref={containerRef}>
+      {/* Loading Overlay */}
+      {!layout && (
+        <div className="absolute inset-0 bg-black flex flex-col items-center justify-center font-mono text-xs text-zinc-500 gap-2 z-20">
+          <div className="w-4 h-4 border-2 border-t-transparent border-zinc-500 rounded-full animate-spin" />
+          <span>CALCULATING CITY TOPOLOGY...</span>
+        </div>
+      )}
+
       {/* Three.js Canvas */}
       <canvas
         ref={canvasRef}
@@ -731,6 +1254,39 @@ export default function GraphCanvas({
 
           const isSelected = selectedNodeId === lbl.id;
           const isHovered = hoveredNodeId === lbl.id;
+
+          const matchesSearch = searchQuery.trim() === '' || 
+            lbl.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
+            lbl.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+            lbl.type.toLowerCase().includes(searchQuery.toLowerCase());
+          const matchesCategory = selectedCategory === 'All' || lbl.type === selectedCategory;
+          const isFilterMatched = matchesSearch && matchesCategory;
+
+          const isConnectedToHovered = hoveredNodeId ? graphData.edges.some(
+            e => (e.source === hoveredNodeId && e.target === lbl.id) || (e.target === hoveredNodeId && e.source === lbl.id)
+          ) : false;
+
+          const isConnectedToSelected = selectedNodeId ? graphData.edges.some(
+            e => (e.source === selectedNodeId && e.target === lbl.id) || (e.target === selectedNodeId && e.source === lbl.id)
+          ) : false;
+
+          const isConnectedToHoveredEdge = hoveredEdge ? (
+            hoveredEdge.source === lbl.id || hoveredEdge.target === lbl.id
+          ) : false;
+
+          const hasFocus = !!selectedNodeId || !!hoveredNodeId || !!hoveredEdge || searchQuery.trim().length > 0 || selectedCategory !== 'All';
+
+          let labelState: 'highlight' | 'normal' | 'dimmed' = 'normal';
+          if (isSelected || isHovered) {
+            labelState = 'highlight';
+          } else if (isConnectedToHovered || isConnectedToSelected || isConnectedToHoveredEdge) {
+            labelState = 'highlight';
+          } else if (hasFocus && isFilterMatched) {
+            labelState = 'highlight';
+          } else if (hasFocus) {
+            labelState = 'dimmed';
+          }
+
           const config = TYPE_CONFIGS[lbl.type] || { color: '#ffffff' };
 
           return (
@@ -740,7 +1296,7 @@ export default function GraphCanvas({
               style={{
                 left: `${lbl.x}px`,
                 top: `${lbl.y}px`,
-                zIndex: isSelected ? 30 : isHovered ? 20 : 10,
+                zIndex: isSelected ? 30 : isHovered || labelState === 'highlight' ? 20 : 10,
               }}
             >
               {/* Dynamic tag container */}
@@ -748,31 +1304,25 @@ export default function GraphCanvas({
                 onClick={() => onSelectNode(lbl.id)}
                 onMouseEnter={() => onHoverNode(lbl.id)}
                 onMouseLeave={() => onHoverNode(null)}
-                className={`px-2 py-0.5 rounded-md border text-[10px] font-mono font-medium shadow-lg backdrop-blur-md flex items-center gap-1 transition-all ${
+                className={`px-2 py-0.5 rounded border text-[10px] font-mono font-medium shadow-md backdrop-blur-md flex items-center gap-1 transition-all ${
                   isSelected
-                    ? 'bg-slate-900/90 text-white scale-110 shadow-indigo-500/30'
-                    : isHovered
-                    ? 'bg-slate-950/80 text-white scale-105'
-                    : 'bg-slate-950/60 text-slate-300'
+                    ? 'bg-black text-white scale-110 border-white shadow-lg shadow-white/5 font-bold'
+                    : isHovered || labelState === 'highlight'
+                    ? 'bg-black text-white scale-105 border-zinc-500 font-semibold'
+                    : labelState === 'dimmed'
+                    ? 'bg-black/30 text-zinc-650 border-zinc-900 opacity-20 scale-95 pointer-events-none'
+                    : 'bg-black text-zinc-400 border-zinc-800 hover:text-white hover:border-zinc-500'
                 }`}
-                style={{
-                  borderColor: isSelected || isHovered ? config.color : 'rgba(30,41,59,0.5)',
-                  boxShadow: isSelected ? `0 4px 12px ${config.color}40` : '',
-                }}
               >
-                {/* Visual indicator color sphere */}
-                <span
-                  className="w-1.5 h-1.5 rounded-full inline-block animate-pulse"
-                  style={{ backgroundColor: config.color }}
-                />
                 {lbl.label}
               </button>
 
               {/* Little anchor line triangle */}
               <div
-                className="w-0 h-0 border-l-[4px] border-r-[4px] border-t-[4px] border-l-transparent border-r-transparent mt-[-1px]"
+                className="w-0 h-0 border-l-[4px] border-r-[4px] border-t-[4px] border-l-transparent border-r-transparent mt-[-1px] transition-all"
                 style={{
-                  borderTopColor: isSelected || isHovered ? config.color : 'rgba(30,41,59,0.5)',
+                  borderTopColor: isSelected ? '#ffffff' : isHovered || labelState === 'highlight' ? '#71717a' : labelState === 'dimmed' ? 'transparent' : '#27272a',
+                  opacity: labelState === 'dimmed' ? 0.1 : 1.0,
                 }}
               />
             </div>
@@ -780,39 +1330,136 @@ export default function GraphCanvas({
         })}
       </div>
 
-      {/* Futuristic Floating Dashboard Overlays */}
-      <div className="absolute top-4 left-4 flex gap-2 z-20 pointer-events-auto">
-        {/* Camera Toggle */}
-        <button
-          onClick={() => setIsIsometric((p) => !p)}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-medium transition-all shadow-md backdrop-blur-md ${
-            isIsometric
-              ? 'bg-indigo-950/40 text-indigo-200 border-indigo-500/50 hover:bg-indigo-900/50'
-              : 'bg-slate-900/50 text-slate-300 border-slate-700/60 hover:bg-slate-800/60'
-          }`}
-          title={isIsometric ? 'Lock SimCity-style orthographic projection' : 'Unlock perspective camera rotation'}
-        >
-          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: isIsometric ? '#6366f1' : '#94a3b8' }} />
-          {isIsometric ? 'CAM: ISOMETRIC' : 'CAM: PERSPECTIVE'}
-        </button>
+      {/* Floating Holographic Relation Tooltip */}
+      {hoveredEdge && (
+        (() => {
+          const sGroup = nodeMeshesRef.current.get(hoveredEdge.source);
+          const tGroup = nodeMeshesRef.current.get(hoveredEdge.target);
+          const sPhys = physicsNodesRef.current.get(hoveredEdge.source);
+          const tPhys = physicsNodesRef.current.get(hoveredEdge.target);
 
-        {/* Physics Force Toggle */}
-        <button
-          onClick={() => setEnablePhysics((p) => !p)}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-medium transition-all shadow-md backdrop-blur-md ${
-            enablePhysics
-              ? 'bg-emerald-950/40 text-emerald-200 border-emerald-500/50 hover:bg-emerald-900/50'
-              : 'bg-slate-900/50 text-slate-300 border-slate-700/60 hover:bg-slate-800/60'
-          }`}
-          title="Toggle spring force alignment simulation"
-        >
-          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: enablePhysics ? '#10b981' : '#94a3b8' }} />
-          {enablePhysics ? 'PHYSICS: ACTIVE' : 'PHYSICS: PAUSED'}
-        </button>
+          if (sGroup && tGroup && sPhys && tPhys && containerRef.current && cameraRef.current) {
+            const w = containerRef.current.clientWidth;
+            const h = containerRef.current.clientHeight;
+
+            const vS = new THREE.Vector3(sGroup.position.x, sPhys.height / 2, sGroup.position.z);
+            const vT = new THREE.Vector3(tGroup.position.x, tPhys.height / 2, tGroup.position.z);
+
+            // Midpoint
+            const midV = new THREE.Vector3().addVectors(vS, vT).multiplyScalar(0.5);
+            midV.project(cameraRef.current);
+
+            const x = (midV.x * 0.5 + 0.5) * w;
+            const y = (midV.y * -0.5 + 0.5) * h;
+
+            // Don't show if offscreen
+            if (x >= 0 && x <= w && y >= 0 && y <= h) {
+              return (
+                <div
+                  className="absolute -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none flex flex-col items-center animate-fade-in"
+                  style={{ left: `${x}px`, top: `${y}px` }}
+                >
+                  <div className="px-2.5 py-1 rounded bg-black/95 border border-zinc-300 text-[10px] font-mono font-bold tracking-wider text-white shadow-2xl flex items-center gap-1.5 backdrop-blur-md">
+                    <span className="text-[8px] text-zinc-500 font-normal uppercase">RELATION:</span>
+                    <span className="text-zinc-200">{hoveredEdge.relation}</span>
+                  </div>
+                </div>
+              );
+            }
+          }
+          return null;
+        })()
+      )}
+
+      {/* Floating Dashboard Overlays */}
+      <div className="absolute top-4 left-4 right-4 flex flex-col md:flex-row md:items-center justify-between gap-3 z-20 pointer-events-none">
+        {/* Left Side: System Controls & Search */}
+        <div className="flex flex-wrap items-center gap-2 pointer-events-auto">
+          {/* Camera Toggle */}
+          <button
+            onClick={() => setIsIsometric((p) => !p)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-mono font-medium transition-all shadow-sm cursor-pointer ${
+              isIsometric
+                ? 'bg-white text-black border-white font-bold'
+                : 'bg-black text-zinc-400 border-zinc-800 hover:border-zinc-700 hover:text-zinc-200'
+            }`}
+            title={isIsometric ? 'Lock SimCity-style orthographic projection' : 'Unlock perspective camera rotation'}
+          >
+            {isIsometric ? 'CAM: ISOMETRIC' : 'CAM: PERSPECTIVE'}
+          </button>
+
+          {/* Physics Force Toggle */}
+          <button
+            onClick={() => setEnablePhysics((p) => !p)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-mono font-medium transition-all shadow-sm cursor-pointer ${
+              enablePhysics
+                ? 'bg-white text-black border-white font-bold'
+                : 'bg-black text-zinc-400 border-zinc-800 hover:border-zinc-700 hover:text-zinc-200'
+            }`}
+            title="Toggle spring force alignment simulation"
+          >
+            {enablePhysics ? 'PHYSICS: ACTIVE' : 'PHYSICS: PAUSED'}
+          </button>
+
+          {/* D3 Auto-Layout Trigger */}
+          <button
+            onClick={() => {
+              const positions = runD3Simulation(graphData.nodes, graphData.edges);
+              setD3Positions(positions);
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-mono font-medium transition-all shadow-sm cursor-pointer bg-black text-zinc-400 border-zinc-800 hover:border-zinc-700 hover:text-zinc-200"
+            title="Run D3 force-directed simulation to align skyscrapers to city block lots"
+          >
+            GRID: ALIGN (D3)
+          </button>
+
+          {/* Search Bar */}
+          <div className="relative flex items-center bg-black/95 border border-zinc-800 rounded px-2.5 py-1.5 shadow-md">
+            <span className="text-zinc-500 font-mono text-[9px] mr-1.5 uppercase select-none font-bold">SEARCH:</span>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Label, type, id..."
+              className="bg-transparent text-white font-mono text-[10px] placeholder-zinc-650 focus:outline-none w-28 focus:w-40 transition-all border-0 p-0"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="text-zinc-500 hover:text-white font-mono text-[10px] ml-1.5 px-0.5 cursor-pointer"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Right Side: Category Filters */}
+        <div className="flex flex-wrap items-center gap-1 bg-black/95 border border-zinc-800 rounded p-1 shadow-md pointer-events-auto">
+          <span className="text-zinc-500 font-mono text-[9px] px-1.5 uppercase select-none font-bold">HIGHLIGHT:</span>
+          {CATEGORIES.map((cat) => {
+            const isSel = selectedCategory === cat;
+            const config = cat === 'All' ? { color: '#ffffff', hex: 0xffffff } : TYPE_CONFIGS[cat];
+            return (
+              <button
+                key={cat}
+                onClick={() => setSelectedCategory(cat)}
+                className={`px-2 py-1 rounded text-[9px] font-mono font-bold uppercase transition-all cursor-pointer ${
+                  isSel
+                    ? 'bg-zinc-100 text-black font-bold'
+                    : 'bg-zinc-900/60 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200'
+                }`}
+                style={isSel && cat !== 'All' ? { backgroundColor: config.color, color: '#000000' } : {}}
+              >
+                {cat}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {/* Cyberpunk grid scale indicator */}
-      <div className="absolute bottom-4 right-4 pointer-events-none text-[9px] font-mono text-slate-500/80 bg-slate-950/40 px-2 py-1 rounded border border-slate-900/40 backdrop-blur-sm flex flex-col items-end gap-1">
+      {/* Grid scale indicator */}
+      <div className="absolute bottom-4 right-4 pointer-events-none text-[9px] font-mono text-zinc-500 bg-black px-2 py-1 rounded border border-zinc-800 flex flex-col items-end gap-1">
         <span>GRID RANGE: 80x80 units</span>
         <span>DRAG: SHIFT + DRAG MOUSE</span>
         <span>ROTATION: ORBIT CONTROL LOCK</span>
