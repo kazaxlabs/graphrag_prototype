@@ -1,0 +1,6 @@
+{
+  "name": "GraphRAG City",
+  "description": "3D Graph visualization and unstructured text extractor platform representing entities as interactive holographic cityscape buildings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
